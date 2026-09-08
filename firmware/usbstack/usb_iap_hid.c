@@ -36,7 +36,7 @@
 #include "usb_ch9.h"
 #include "iap.h"
 
-/* #define LOGF_ENABLE */
+#define LOGF_ENABLE
 #include "logf.h"
 #include "kernel.h"
 
@@ -63,7 +63,7 @@
  * Exact bytes from Apple's iPod firmware (via ipod-gadget reference).
  */
 static const unsigned char iap_hid_report_desc[] = {
-    0x06, 0x00, 0xff, 0x09, 0x01, 0xa1, 0x01, 0x75, 0x08, 0x26, 0x80, 0x00,
+    0x06, 0x00, 0xff, 0x09, 0x01, 0xa1, 0x01, 0x75, 0x08, 0x26, 0xff, 0x00,
     0x15, 0x00, 0x09, 0x01, 0x85, 0x01, 0x95, 0x0c, 0x82, 0x02, 0x01, 0x09,
     0x01, 0x85, 0x02, 0x95, 0x0e, 0x82, 0x02, 0x01, 0x09, 0x01, 0x85, 0x03,
     0x95, 0x14, 0x82, 0x02, 0x01, 0x09, 0x01, 0x85, 0x04, 0x95, 0x3f, 0x82,
@@ -196,7 +196,11 @@ static void iap_hid_tx(const unsigned char *buf, int len)
     /* Wait for previous HID TX to complete before touching tx_buf.
      * A 64-byte full-speed interrupt transfer completes in <2ms.
      * 20ms timeout avoids blocking audio if something goes wrong. */
-    semaphore_wait(&tx_complete_sem, HZ/50);
+    if (semaphore_wait(&tx_complete_sem, HZ/50) == OBJ_WAIT_TIMEDOUT)
+    {
+        logf("iap_hid: tx wait timeout tick=%ld", current_tick);
+        return;
+    }
 
     /* find smallest IN report ID that fits */
     uint8_t report_id = 0;
@@ -238,7 +242,23 @@ static void iap_hid_tx(const unsigned char *buf, int len)
          (len > 2) ? tx_buf[3] : 0, (len > 3) ? tx_buf[4] : 0,
          (len > 4) ? tx_buf[5] : 0);
 
-    usb_drv_send_nonblocking(EP_IAP_HID_IN, tx_buf, 1 + report_size);
+    if (len >= 20)
+    {
+        logf("iap_hid: txfull0  %02x %02x %02x %02x %02x %02x %02x %02x",
+             tx_buf[0], tx_buf[1], tx_buf[2], tx_buf[3],
+             tx_buf[4], tx_buf[5], tx_buf[6], tx_buf[7]);
+        logf("iap_hid: txfull8  %02x %02x %02x %02x %02x %02x %02x %02x",
+             tx_buf[8], tx_buf[9], tx_buf[10], tx_buf[11],
+             tx_buf[12], tx_buf[13], tx_buf[14], tx_buf[15]);
+        logf("iap_hid: txfull16 %02x %02x %02x %02x %02x",
+             tx_buf[16], tx_buf[17], tx_buf[18],
+             tx_buf[19], tx_buf[20]);
+    }
+
+    int rc = usb_drv_send_nonblocking(EP_IAP_HID_IN, tx_buf,
+                                      1 + report_size);
+    logf("iap_hid: tx submit tick=%ld ep=%d rc=%d bytes=%d",
+         current_tick, EP_IAP_HID_IN, rc, 1 + report_size);
 }
 
 /*
@@ -264,6 +284,7 @@ static bool iap_hid_rx_in_progress = false;
 
 static void iap_hid_process_rx(const unsigned char *data, int len)
 {
+    logf("iap_hid: rx enter tick=%ld", current_tick);
     int i;
 
     if (len < 3)
@@ -308,13 +329,25 @@ static void iap_hid_process_rx(const unsigned char *data, int len)
     if (iap_len > len - 2)
         iap_len = len - 2;
 
-    logf("iap_hid: rx id=%d len=%d wLen=%d",
-         report_id, iap_len, len);
+    logf("iap_hid: rx tick=%ld id=%d len=%d wLen=%d",
+         current_tick, report_id, iap_len, len);
     logf("iap_hid: [%02x %02x %02x %02x %02x %02x %02x %02x]",
          data[0], len > 1 ? data[1] : 0, len > 2 ? data[2] : 0,
          len > 3 ? data[3] : 0, len > 4 ? data[4] : 0,
          len > 5 ? data[5] : 0, len > 6 ? data[6] : 0,
          len > 7 ? data[7] : 0);
+
+    if (len >= 21)
+    {
+        logf("iap_hid: rxfull0  %02x %02x %02x %02x %02x %02x %02x %02x",
+             data[0], data[1], data[2], data[3],
+             data[4], data[5], data[6], data[7]);
+        logf("iap_hid: rxfull8  %02x %02x %02x %02x %02x %02x %02x %02x",
+             data[8], data[9], data[10], data[11],
+             data[12], data[13], data[14], data[15]);
+        logf("iap_hid: rxfull16 %02x %02x %02x %02x %02x",
+             data[16], data[17], data[18], data[19], data[20]);
+    }
 
     const unsigned char *iap_data = data + 2;
 
@@ -420,10 +453,8 @@ void usb_iap_hid_disconnect(void)
 
 void usb_iap_hid_transfer_complete(int ep, int dir, int status, int length)
 {
-    (void) ep;
-    (void) dir;
-    (void) status;
-    (void) length;
+    logf("iap_hid: tx complete tick=%ld ep=%d dir=%d status=%d len=%d",
+         current_tick, ep, dir, status, length);
     semaphore_release(&tx_complete_sem);
 }
 
@@ -431,7 +462,6 @@ void usb_iap_hid_transfer_complete(int ep, int dir, int status, int length)
 bool usb_iap_hid_control_request(struct usb_ctrlrequest *req, void *reqdata,
                                   unsigned char *dest)
 {
-    (void) dest;
 
     switch (req->bRequest)
     {
@@ -442,15 +472,15 @@ bool usb_iap_hid_control_request(struct usb_ctrlrequest *req, void *reqdata,
             if (desc_type == HID_DT_REPORT)
             {
                 int len = MIN(req->wLength, (int)sizeof(iap_hid_report_desc));
-                memcpy(rx_buf, iap_hid_report_desc, len);
-                usb_drv_control_response(USB_CONTROL_ACK, rx_buf, len);
+                memcpy(dest, iap_hid_report_desc, len);
+                usb_drv_control_response(USB_CONTROL_ACK, dest, len);
                 return true;
             }
             else if (desc_type == HID_DT_HID)
             {
                 int len = MIN(req->wLength, (int)sizeof(iap_hid_desc));
-                memcpy(rx_buf, &iap_hid_desc, len);
-                usb_drv_control_response(USB_CONTROL_ACK, rx_buf, len);
+                memcpy(dest, &iap_hid_desc, len);
+                usb_drv_control_response(USB_CONTROL_ACK, dest, len);
                 return true;
             }
             return false;
@@ -460,16 +490,31 @@ bool usb_iap_hid_control_request(struct usb_ctrlrequest *req, void *reqdata,
             /* return zeros */
             {
                 int len = MIN(req->wLength, (int)sizeof(rx_buf));
-                memset(rx_buf, 0, len);
-                usb_drv_control_response(USB_CONTROL_ACK, rx_buf, len);
+                memset(dest, 0, len);
+                usb_drv_control_response(USB_CONTROL_ACK, dest, len);
             }
             return true;
 
         case HID_REQ_SET_REPORT:
             if (reqdata)
             {
-                iap_hid_process_rx(rx_buf, req->wLength);
+                int len = MIN(req->wLength, (int)sizeof(rx_buf));
+
+                logf("iap_hid: SET_REPORT process start tick=%ld",
+                     current_tick);
+
+                /* Match current Rockpod ordering: process the received
+                 * iAP report first so any HID IN response is already
+                 * queued before completing the EP0 status stage. */
+                iap_hid_process_rx(rx_buf, len);
+
+                logf("iap_hid: SET_REPORT status ACK start tick=%ld",
+                     current_tick);
+
                 usb_drv_control_response(USB_CONTROL_ACK, NULL, 0);
+
+                logf("iap_hid: SET_REPORT status ACK done tick=%ld",
+                     current_tick);
             }
             else
             {

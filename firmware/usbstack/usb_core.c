@@ -1366,6 +1366,15 @@ void usb_drv_control_response(enum usb_control_response resp,
         {
             control_write_data = data;
             control_write_data_done = true;
+
+            /*
+             * usb_drv_control_response() decremented num_active_requests
+             * on entry, but a control-write request is not finished yet:
+             * after this OUT data stage we still owe the host the IN
+             * status stage. Keep this request active until that ACK.
+             */
+            num_active_requests++;
+
             usb_drv_recv_nonblocking(EP_CONTROL, data, length);
         }
         else if(resp == USB_CONTROL_STALL)

@@ -1354,6 +1354,7 @@ Lyre prototype 1 */
 #define USB_HAS_INTERRUPT
 #if (CONFIG_USBOTG == USBOTG_ARC)
 #define USB_HAS_ISOCHRONOUS
+#define USB_BATCH_SLOTS 8
 #endif
 #define USB_LEGACY_CONTROL_API
 #elif defined(CPU_TCC780X)

@@ -30,7 +30,7 @@
 #include "panic.h"
 #include "usb_drv.h"
 
-/*#define LOGF_ENABLE*/
+#define LOGF_ENABLE
 #include "logf.h"
 
 /* USB device mode registers (Little Endian) */
@@ -362,6 +362,7 @@ static const unsigned int pipe2mask[USB_NUM_ENDPOINTS*2] = {
 /*-------------------------------------------------------------------------*/
 static void transfer_completed(void);
 static void control_received(void);
+static void sof_received(void);
 static int prime_transfer(int ep_num, void* ptr, int len, bool send, bool wait);
 static void prepare_td(struct transfer_descriptor* td,
         struct transfer_descriptor* previous_td, void *ptr, int len,int pipe);
@@ -544,6 +545,12 @@ void usb_drv_int(void)
     if (status & USBSTS_PORT_CHANGE) {
         REG_USBSTS = USBSTS_PORT_CHANGE;
     }
+
+    /* Start-of-Frame is enabled only while batch ISO streaming. */
+    if (status & USBSTS_SOF) {
+        REG_USBSTS = USBSTS_SOF;
+        sof_received();
+    }
 }
 
 bool usb_drv_stalled(int endpoint,bool in)
@@ -662,6 +669,167 @@ void usb_drv_set_test_mode(int mode)
     }
     usb_drv_reset();
     REG_USBCMD |= USBCMD_RUN;
+}
+
+/* ===== SOF-driven isochronous batch queue ===== */
+
+static struct transfer_descriptor
+    batch_td_array[USB_BATCH_SLOTS]
+    USB_DEVBSS_ATTR __attribute__((aligned(32)));
+
+static uint8_t batch_ep;
+static uint8_t batch_write_cursor;
+static bool batch_stopped;
+static usb_drv_batch_get_more batch_get_more;
+
+static int batch_pipe(int ep)
+{
+    int ep_num = EP_NUM(ep);
+    int dir = EP_DIR(ep);
+    return ep_num * 2 + (dir == DIR_IN ? 1 : 0);
+}
+
+static void batch_set_buffer(struct transfer_descriptor *td,
+                             const void *ptr)
+{
+    unsigned int a = (unsigned int)ptr;
+
+    td->buff_ptr0 = a;
+    td->buff_ptr1 = (a & 0xfffff000) + 0x1000;
+    td->buff_ptr2 = (a & 0xfffff000) + 0x2000;
+    td->buff_ptr3 = (a & 0xfffff000) + 0x3000;
+    td->buff_ptr4 = (a & 0xfffff000) + 0x4000;
+}
+
+int usb_drv_batch_init(int ep, usb_drv_batch_get_more get_more)
+{
+    if (batch_ep != 0 || ep == 0 || get_more == NULL)
+        return -1;
+
+    batch_ep = ep;
+    batch_get_more = get_more;
+    logf("arc: batch init ep=0x%x slots=%d", ep, USB_BATCH_SLOTS);
+    return 0;
+}
+
+static bool batch_fill(void)
+{
+    bool filled = false;
+
+    while (!(batch_td_array[batch_write_cursor].size_ioc_sts &
+             DTD_STATUS_ACTIVE))
+    {
+        const void *ptr = NULL;
+        size_t len = 0;
+
+        batch_get_more(&ptr, &len);
+
+        if (batch_stopped || ptr == NULL || len == 0)
+            break;
+
+        struct transfer_descriptor *td =
+            &batch_td_array[batch_write_cursor];
+
+        batch_set_buffer(td, ptr);
+        td->size_ioc_sts =
+            ((unsigned int)len << DTD_LENGTH_BIT_POS) |
+            DTD_STATUS_ACTIVE;
+
+        batch_write_cursor =
+            (batch_write_cursor + 1) % USB_BATCH_SLOTS;
+
+        filled = true;
+    }
+
+    return filled;
+}
+
+int usb_drv_batch_start(void)
+{
+    if (batch_ep == 0 || batch_get_more == NULL)
+        return -1;
+
+    batch_write_cursor = 0;
+    batch_stopped = false;
+
+    memset(batch_td_array, 0, sizeof(batch_td_array));
+
+    for (int i = 0; i < USB_BATCH_SLOTS; i++)
+        batch_td_array[i].next_td_ptr =
+            (unsigned int)&batch_td_array[(i + 1) % USB_BATCH_SLOTS];
+
+    int pipe = batch_pipe(batch_ep);
+    struct queue_head *qh = &qh_array[pipe];
+
+    qh->curr_dtd_ptr = (unsigned int)&batch_td_array[0];
+    qh->dtd.next_td_ptr = (unsigned int)&batch_td_array[0];
+    qh->dtd.size_ioc_sts = 0;
+
+    batch_fill();
+
+    /* Refill/prime from each 1 ms USB Start-of-Frame. */
+    REG_USBINTR |= USBINTR_SOF_EN;
+
+    logf("arc: batch SOF start");
+    return 0;
+}
+
+int usb_drv_batch_stop(void)
+{
+    if (batch_ep == 0)
+        return 0;
+
+    batch_stopped = true;
+    REG_USBINTR &= ~USBINTR_SOF_EN;
+
+    for (int i = 0; i < USB_BATCH_SLOTS; i++)
+        batch_td_array[i].next_td_ptr = DTD_NEXT_TERMINATE;
+
+    int pipe = batch_pipe(batch_ep);
+    unsigned int mask = pipe2mask[pipe];
+
+    REG_ENDPTFLUSH = mask;
+    while (REG_ENDPTFLUSH & mask);
+
+    logf("arc: batch SOF stop");
+    return 0;
+}
+
+int usb_drv_batch_deinit(void)
+{
+    if (batch_ep == 0)
+        return 0;
+
+    usb_drv_batch_stop();
+    batch_ep = 0;
+    batch_get_more = NULL;
+    return 0;
+}
+
+static void sof_received(void)
+{
+    if (batch_ep == 0 || batch_stopped)
+        return;
+
+    int pipe = batch_pipe(batch_ep);
+    unsigned int mask = pipe2mask[pipe];
+    struct queue_head *qh = &qh_array[pipe];
+
+    struct transfer_descriptor *current =
+        (struct transfer_descriptor *)qh->curr_dtd_ptr;
+
+    if (current != NULL &&
+        current != (struct transfer_descriptor *)DTD_NEXT_TERMINATE &&
+        (current->size_ioc_sts & DTD_ERROR_MASK))
+    {
+        logf("arc: batch td error 0x%x",
+             current->size_ioc_sts);
+    }
+
+    batch_fill();
+
+    /* Keep the controller supplied ahead of the host's ISO IN polls. */
+    REG_ENDPTPRIME |= mask;
 }
 
 /*-------------------------------------------------------------------------*/
@@ -818,6 +986,10 @@ int usb_drv_init_endpoint(int endpoint, int type, int max_packet_size) {
             max_packet_size = usb_drv_port_speed() ? 512 : 64;
         }
     }
+    logf("ep cfg: %d %s %s speed=%d mps=%d",
+         ep_num, XFER_DIR_STR(ep_dir), XFER_TYPE_STR(type),
+         usb_drv_port_speed(), max_packet_size);
+
     if(type == USB_ENDPOINT_XFER_ISOC)
         /* FIXME: we can adjust the number of packets per frame, currently use one */
         qh->max_pkt_length = max_packet_size << QH_MAX_PKT_LEN_POS | QH_ZLT_SEL | 1 << QH_MULT_POS;
@@ -926,6 +1098,19 @@ static void transfer_completed(void)
                     qh->wait=0;
                     semaphore_release(&transfer_completion_signal[pipe]);
                 }
+
+                if (ep == 0)
+                    logf("arc: EP0 %s done tick=%ld frame=%u len=%d status=%d",
+                         dir ? "IN" : "OUT",
+                         current_tick,
+                         (REG_FRINDEX & USB_FRINDEX_MASKS) >> 3,
+                         length, qh->status);
+
+                if (ep == 2 && dir == 1)
+                    logf("arc: EP2 IN done tick=%ld frame=%u len=%d status=%d",
+                         current_tick,
+                         (REG_FRINDEX & USB_FRINDEX_MASKS) >> 3,
+                         length, qh->status);
 
                 usb_core_transfer_complete(ep, dir?USB_DIR_IN:USB_DIR_OUT,
                         qh->status, length);

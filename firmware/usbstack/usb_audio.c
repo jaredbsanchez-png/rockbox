@@ -49,7 +49,7 @@
 #include "audiohw.h"
 #endif
 
-/* #define LOGF_ENABLE */
+#define LOGF_ENABLE
 #include "logf.h"
 
 /* Fixed-point conversion macros (signed Q16.16) */
@@ -608,6 +608,17 @@ static unsigned char tx_buf[2][TX_FRAME_SIZE] USB_DEVBSS_ATTR;
 static int tx_buf_idx;       /* index of buffer currently being DMA'd */
 static int tx_next_bytes;    /* pre-computed frame size for next re-arm */
 
+#ifdef USB_BATCH_SLOTS
+/* Dedicated DMA-safe staging buffers for the SOF batch queue.
+ * Eight slots provide ~8 ms of queued USB audio while fitting
+ * comfortably in the PP5022's limited IRAM. */
+static unsigned char
+    source_batch_buf[USB_BATCH_SLOTS][TX_FRAME_SIZE]
+    USB_DEVBSS_ATTR __attribute__((aligned(32)));
+static int source_batch_buf_idx;
+static bool source_batch_initialized;
+#endif
+
 /* USB-driven pull mode state (replaces ring buffer in source mode).
  * Audio data is pulled directly from the PCM mixer at USB frame rate,
  * adapted from rockbox-mojyack's batch_get_more() pattern. */
@@ -1019,6 +1030,11 @@ static void set_source_sampling_frequency(unsigned long f)
         hw_freq_sampr[as_source_freq_idx], f);
 }
 
+void usb_audio_set_source_sampling_frequency(unsigned long f)
+{
+    set_source_sampling_frequency(f);
+}
+
 /* Ring buffer hook for legacy (non-pull) source mode.
  * Currently unused — pull mode drives audio from the USB ISR directly.
  * Kept for potential fallback. */
@@ -1130,6 +1146,32 @@ static void source_fill_buffer(unsigned char *buf, int frame_bytes)
     }
 }
 
+#ifdef USB_BATCH_SLOTS
+static void source_batch_get_more(const void **ptr, size_t *len)
+{
+    if (!source_streaming)
+    {
+        *ptr = NULL;
+        *len = 0;
+        return;
+    }
+
+    int bytes = source_frame_bytes();
+    unsigned char *buf =
+        source_batch_buf[source_batch_buf_idx];
+
+    source_fill_buffer(buf, bytes);
+
+    *ptr = buf;
+    *len = bytes;
+
+    source_batch_buf_idx =
+        (source_batch_buf_idx + 1) % USB_BATCH_SLOTS;
+
+    source_frames_sent++;
+}
+#endif
+
 static void usb_audio_start_source(void)
 {
     logf("usbaudio: start source (pull) at %lu Hz ep=0x%02X", hw_freq_sampr[as_source_freq_idx], EP_ISO_SOURCE_IN);
@@ -1170,6 +1212,33 @@ static void usb_audio_start_source(void)
      * Buffer 0 is sent first; buffer 1 is pre-filled for the
      * next frame.  The ISR will re-arm with the pre-filled buffer
      * immediately (~1us) then fill the freed buffer afterward. */
+#ifdef USB_BATCH_SLOTS
+    source_batch_buf_idx = 0;
+    source_batch_initialized = false;
+
+    if (usb_drv_batch_init(EP_ISO_SOURCE_IN,
+                           source_batch_get_more) == 0)
+    {
+        source_batch_initialized = true;
+
+        if (usb_drv_batch_start() == 0)
+        {
+            logf("usbaudio: source SOF batch active slots=%d",
+                 USB_BATCH_SLOTS);
+            return;
+        }
+
+        logf("usbaudio: batch start failed; legacy fallback");
+        usb_drv_batch_deinit();
+        source_batch_initialized = false;
+    }
+    else
+    {
+        logf("usbaudio: batch init failed; legacy fallback");
+    }
+#endif
+
+    /* diag20 legacy fallback */
     int fb0 = source_frame_bytes();
     source_fill_buffer(tx_buf[0], fb0);
     int fb1 = source_frame_bytes();
@@ -1183,6 +1252,14 @@ static void usb_audio_stop_source(void)
 {
     logf("usbaudio: stop source");
     source_streaming = false;
+
+#ifdef USB_BATCH_SLOTS
+    if (source_batch_initialized)
+    {
+        usb_drv_batch_deinit();
+        source_batch_initialized = false;
+    }
+#endif
 
     if (source_pull_mode)
     {
@@ -1928,7 +2005,11 @@ bool usb_audio_fast_transfer_complete(int ep, int dir, int status, int length)
     }
 
     /* Source mode: handle ISO IN completion for audio data */
-    if(ep == EP_NUM(EP_ISO_SOURCE_IN) && source_streaming)
+    if(ep == EP_NUM(EP_ISO_SOURCE_IN) && source_streaming
+#ifdef USB_BATCH_SLOTS
+       && !source_batch_initialized
+#endif
+      )
     {
         /* Double-buffer: re-arm DMA immediately with the pre-filled
          * buffer (~1us), then fill the just-completed buffer for the
