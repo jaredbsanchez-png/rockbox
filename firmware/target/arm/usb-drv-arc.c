@@ -30,7 +30,7 @@
 #include "panic.h"
 #include "usb_drv.h"
 
-/*#define LOGF_ENABLE*/
+#define LOGF_ENABLE
 #include "logf.h"
 
 /* USB device mode registers (Little Endian) */
@@ -818,6 +818,10 @@ int usb_drv_init_endpoint(int endpoint, int type, int max_packet_size) {
             max_packet_size = usb_drv_port_speed() ? 512 : 64;
         }
     }
+    logf("ep cfg: %d %s %s speed=%d mps=%d",
+         ep_num, XFER_DIR_STR(ep_dir), XFER_TYPE_STR(type),
+         usb_drv_port_speed(), max_packet_size);
+
     if(type == USB_ENDPOINT_XFER_ISOC)
         /* FIXME: we can adjust the number of packets per frame, currently use one */
         qh->max_pkt_length = max_packet_size << QH_MAX_PKT_LEN_POS | QH_ZLT_SEL | 1 << QH_MULT_POS;
@@ -926,6 +930,19 @@ static void transfer_completed(void)
                     qh->wait=0;
                     semaphore_release(&transfer_completion_signal[pipe]);
                 }
+
+                if (ep == 0)
+                    logf("arc: EP0 %s done tick=%ld frame=%u len=%d status=%d",
+                         dir ? "IN" : "OUT",
+                         current_tick,
+                         (REG_FRINDEX & USB_FRINDEX_MASKS) >> 3,
+                         length, qh->status);
+
+                if (ep == 2 && dir == 1)
+                    logf("arc: EP2 IN done tick=%ld frame=%u len=%d status=%d",
+                         current_tick,
+                         (REG_FRINDEX & USB_FRINDEX_MASKS) >> 3,
+                         length, qh->status);
 
                 usb_core_transfer_complete(ep, dir?USB_DIR_IN:USB_DIR_OUT,
                         qh->status, length);

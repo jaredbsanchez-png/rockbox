@@ -150,6 +150,7 @@ struct device_t {
                                      */
     uint32_t capabilities_queried;  /* Capabilities already queried */
     bool audio_init_pending;        /* Send GetAccSampleRateCaps after auth */
+    uint16_t ipod_trans_id;          /* Next post-auth iPod-originated transaction ID */
 };
 
 extern struct device_t device;

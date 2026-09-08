@@ -189,7 +189,7 @@ unsigned char lingo_versions[32][2] = {
 #endif
     {0, 0},     /* Accessory Equalizer lingo, 0x08, disabled */
     {0, 0},     /* Reserved, 0x09 */
-    {1, 0},     /* Digital Audio lingo, 0x0A */
+    {1, 2},     /* Digital Audio lingo, 0x0A */
     {}          /* every other lingo, disabled */
 };
 
@@ -216,6 +216,22 @@ static struct state_t {
 enum interface_state interface_state = IST_STANDARD;
 
 struct device_t device;
+
+/* Digital Audio 1.01+: TrackNewAudioAttributes is resent
+ * until the accessory acknowledges command 0x04. */
+static bool audio_attrs_unacked = false;
+static unsigned int audio_attrs_retries = 0;
+#define AUDIO_ATTRS_MAX_RETRIES 8
+
+static void iap_put_next_ipod_trans_id(void)
+{
+    if (device.auth.idps)
+    {
+        IAP_TX_PUT((device.ipod_trans_id >> 8) & 0xff);
+        IAP_TX_PUT(device.ipod_trans_id & 0xff);
+        device.ipod_trans_id++;
+    }
+}
 
 #ifdef IAP_MALLOC_DYNAMIC
 static int iap_move_callback(int handle, void* current, void* new);
@@ -357,6 +373,14 @@ void iap_reset_device(struct device_t* device)
     device->capabilities = 0;
     device->capabilities_queried = 0;
     device->audio_init_pending = false;
+
+    audio_attrs_unacked = false;
+    audio_attrs_retries = 0;
+
+    /* Authentication uses transaction ID 0001 throughout the
+     * existing IDPS authentication exchange.  Begin subsequent
+     * iPod-originated commands at 0002. */
+    device->ipod_trans_id = 2;
 }
 
 static int iap_task(struct timeout *tmo)
@@ -380,6 +404,7 @@ static int iap_task(struct timeout *tmo)
         && device.accinfo != ACCST_SENT
         && device.accinfo != ACCST_DATA
         && !device.audio_init_pending
+        && !audio_attrs_unacked
         && !device.do_notify
         && !iap_shutdown
         && iap_timeoutbtn == 0
@@ -787,6 +812,20 @@ uint32_t iap_get_trackindex(void)
     return (playlist->index - playlist->first_index);
 }
 
+static void iap_send_audio_attrs_retry(void)
+{
+    IAP_TX_INIT(0x0A, 0x04);
+
+    iap_put_next_ipod_trans_id();
+
+    IAP_TX_PUT_U32(44100);  /* sample rate */
+    IAP_TX_PUT_U32(0);      /* sound check value */
+    IAP_TX_PUT_U32(0);      /* volume adjustment */
+    iap_send_tx();
+
+    audio_attrs_unacked = true;
+}
+
 void iap_periodic(void)
 {
     static int count;
@@ -800,6 +839,13 @@ void iap_periodic(void)
         {
             /* Send out GetDevAuthenticationInfo */
             IAP_TX_INIT(0x00, 0x14);
+
+            /* IDPS requires a transaction ID on this iPod-originated
+             * authentication command. */
+            if (device.auth.idps) {
+                IAP_TX_PUT(0x00);
+                IAP_TX_PUT(0x01);
+            }
 
             iap_send_tx();
             device.auth.state = AUST_CERTREQ;
@@ -838,17 +884,28 @@ void iap_periodic(void)
         }
     }
 
+    /* Digital Audio 1.01+: resend TrackNewAudioAttributes
+     * until the accessory acknowledges command 0x04. */
+    if (audio_attrs_unacked && DEVICE_AUTHENTICATED)
+    {
+        if (audio_attrs_retries < AUDIO_ATTRS_MAX_RETRIES)
+        {
+            audio_attrs_retries++;
+            iap_send_audio_attrs_retry();
+        }
+        else
+        {
+            audio_attrs_unacked = false;
+        }
+    }
+
     /* Digital audio activation after IDPS auth */
     if (device.audio_init_pending && DEVICE_AUTHENTICATED)
     {
         device.audio_init_pending = false;
 
         IAP_TX_INIT(0x0A, 0x02);
-        if (device.auth.idps) {
-            /* Generate outgoing transID (doesn't need to match anything) */
-            IAP_TX_PUT(0x00);
-            IAP_TX_PUT(0x01);
-        }
+        iap_put_next_ipod_trans_id();
         iap_send_tx();
     }
 
@@ -883,6 +940,7 @@ void iap_periodic(void)
     {
         /* GetAccessoryInfo */
         IAP_TX_INIT(0x00, 0x27);
+        iap_put_next_ipod_trans_id();
         IAP_TX_PUT(0x00);
 
         iap_send_tx();
@@ -1372,23 +1430,28 @@ static void iap_handlepkt_mode10(const unsigned int len, const unsigned char *bu
 
     switch (cmd)
     {
-        /* AccAck (0x00) — ignore */
+        /* AccessoryAck (0x00) */
         case 0x00:
+            if (len >= (unsigned int)(off + 2) &&
+                buf[off + 1] == 0x04)
+            {
+                audio_attrs_unacked = false;
+            }
             break;
 
-        /* RetAccSampleRateCaps (0x03) — respond with TrackNewAudioAttributes */
+        /* RetAccSampleRateCaps (0x03) — send
+         * TrackNewAudioAttributes and retry until acknowledged. */
         case 0x03:
         {
-            (void)off;
-            IAP_TX_INIT(0x0A, 0x04);
-            if (device.auth.idps) {
-                IAP_TX_PUT(tid_hi);
-                IAP_TX_PUT(tid_lo);
-            }
-            IAP_TX_PUT_U32(44100);  /* sample rate */
-            IAP_TX_PUT_U32(0);      /* sound check value */
-            IAP_TX_PUT_U32(0);      /* volume adjustment */
-            iap_send_tx();
+            audio_attrs_retries = 0;
+
+#ifdef USB_ENABLE_AUDIO
+            /* Keep the actual USB Audio source rate synchronized with
+             * the rate reported in TrackNewAudioAttributes. */
+            usb_audio_set_source_sampling_frequency(44100);
+#endif
+
+            iap_send_audio_attrs_retry();
             break;
         }
 

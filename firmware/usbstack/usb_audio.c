@@ -49,7 +49,7 @@
 #include "audiohw.h"
 #endif
 
-/* #define LOGF_ENABLE */
+#define LOGF_ENABLE
 #include "logf.h"
 
 /* Fixed-point conversion macros (signed Q16.16) */
@@ -1017,6 +1017,11 @@ static void set_source_sampling_frequency(unsigned long f)
 
     logf("usbaudio: set source sampling frequency to %lu Hz for a requested %lu Hz",
         hw_freq_sampr[as_source_freq_idx], f);
+}
+
+void usb_audio_set_source_sampling_frequency(unsigned long f)
+{
+    set_source_sampling_frequency(f);
 }
 
 /* Ring buffer hook for legacy (non-pull) source mode.
