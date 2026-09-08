@@ -110,6 +110,14 @@ int usb_drv_get_frame_number(void);
 int usb_drv_get_iisoixfr_count(void);
 #endif
 
+#ifdef USB_BATCH_SLOTS
+typedef void (*usb_drv_batch_get_more)(const void **ptr, size_t *len);
+int usb_drv_batch_init(int ep, usb_drv_batch_get_more get_more);
+int usb_drv_batch_start(void);
+int usb_drv_batch_stop(void);
+int usb_drv_batch_deinit(void);
+#endif
+
 /* USB_STRING_INITIALIZER(u"Example String") */
 #define USB_STRING_INITIALIZER(S) { \
     sizeof(struct usb_string_descriptor) + sizeof(S) - sizeof(*S), \
