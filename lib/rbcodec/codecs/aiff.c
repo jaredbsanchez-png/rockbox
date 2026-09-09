@@ -31,6 +31,8 @@ CODEC_HEADER
 /* This codec supports the following AIFC compressionType formats */
 enum {
     AIFC_FORMAT_PCM          = FOURCC('N', 'O', 'N', 'E'), /* AIFC PCM Format (big endian) */
+    AIFC_FORMAT_PCM_BE       = FOURCC('t', 'w', 'o', 's'), /* AIFC PCM Format (big endian) */
+    AIFC_FORMAT_PCM_LE       = FOURCC('s', 'o', 'w', 't'), /* AIFC PCM Format (little endian) */
     AIFC_FORMAT_ALAW         = FOURCC('a', 'l', 'a', 'w'), /* AIFC ALaw compressed */
     AIFC_FORMAT_MULAW        = FOURCC('u', 'l', 'a', 'w'), /* AIFC uLaw compressed */
     AIFC_FORMAT_IEEE_FLOAT32 = FOURCC('f', 'l', '3', '2'), /* AIFC IEEE float 32 bit */
@@ -40,6 +42,8 @@ enum {
 
 static const struct pcm_entry pcm_codecs[] = {
     { AIFC_FORMAT_PCM,          get_linear_pcm_codec      },
+    { AIFC_FORMAT_PCM_BE,       get_linear_pcm_codec      },
+    { AIFC_FORMAT_PCM_LE,       get_linear_pcm_codec      },
     { AIFC_FORMAT_ALAW,         get_itut_g711_alaw_codec  },
     { AIFC_FORMAT_MULAW,        get_itut_g711_mulaw_codec },
     { AIFC_FORMAT_IEEE_FLOAT32, get_ieee_float_codec      },
@@ -86,7 +90,7 @@ enum codec_status codec_run(void)
     unsigned char *buf;
     uint8_t *aifbuf;
     uint32_t offset2snd = 0;
-    off_t firstblockposn;     /* position of the first block in file */
+    off_t firstblockposn = 0; /* position of the first block in file */
     bool is_aifc = false;
     const struct pcm_codec *codec;
     uint32_t size;
@@ -167,6 +171,8 @@ enum codec_status codec_run(void)
             if (is_aifc)
             {
                 format.formattag = (buf[26]<<24)|(buf[27]<<16)|(buf[28]<<8)|buf[29];
+                format.is_little_endian =
+                    (format.formattag == AIFC_FORMAT_PCM_LE);
 
                 /*
                  * aiff's sample_size is uncompressed sound data size.
@@ -194,7 +200,13 @@ enum codec_status codec_run(void)
             if (format.blockalign == 0)
                 format.blockalign = format.channels * format.bitspersample >> 3;
             format.numbytes = size - 8 - offset2snd;
-            size = 8 + offset2snd; /* advance to the beginning of data */
+
+            /* The SSND offset may legally place the first sample beyond the
+             * initial 1024-byte header buffer. Record its absolute position
+             * and seek there after parsing instead of requiring the padding
+             * to fit in that buffer. */
+            firstblockposn = (off_t)(1024 - n) + 16 + offset2snd;
+            break;
         } else if (is_aifc && (memcmp(buf, "FVER", 4)==0)) {
             /* Format Version Chunk (AIFC only chunk) */
             /* skip this chunk */
@@ -271,8 +283,11 @@ enum codec_status codec_run(void)
         return CODEC_ERROR;
     }
 
-    firstblockposn = 1024 - n;
-    ci->advance_buffer(firstblockposn);
+    if (firstblockposn == 0 || !ci->seek_buffer(firstblockposn))
+    {
+        DEBUGF("CODEC_ERROR: cannot seek to AIFF sound data\n");
+        return CODEC_ERROR;
+    }
 
     /* make sure we're at the correct offset */
     if (bytesdone > (uint32_t) firstblockposn || param) {
