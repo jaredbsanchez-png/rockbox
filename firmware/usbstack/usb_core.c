@@ -956,8 +956,6 @@ static void usb_core_do_clear_feature(int recip, int recip_nr, int feature)
 
 static void request_handler_device(struct usb_ctrlrequest* req, uint8_t* reqdata, size_t reqdata_size)
 {
-    unsigned address;
-
     switch(req->bRequest) {
         case USB_REQ_GET_CONFIGURATION:
             logf("usb_core: GET_CONFIG");
@@ -976,11 +974,11 @@ static void request_handler_device(struct usb_ctrlrequest* req, uint8_t* reqdata
             /* NOTE: We really have no business handling this and drivers
              * should just handle it themselves. We don't care beyond
              * knowing if we've been assigned an address yet, or not. */
-            address = req->wValue;
+            /* Cancel stale transfers before starting the SET_ADDRESS
+             * status stage.  Do not apply the new address until that
+             * zero-length IN status packet has actually completed. */
             usb_drv_cancel_all_transfers();
             usb_core_control_response(USB_CONTROL_ACK, NULL, 0);
-            usb_drv_set_address(address);
-            usb_core_do_set_addr(address);
             break;
         case USB_REQ_GET_DESCRIPTOR:
             logf("usb_core: GET_DESC %d", req->wValue >> 8);
@@ -1278,6 +1276,17 @@ void usb_core_transfer_complete(int ep, int dir, int status, int length) {
         break;
     case USB_DIR_IN | EP0_EXPECT_RX_STATUS_COMP:
         logf("usb_core: control-out done success=%d", status == 0 && length == 0);
+
+        if(status == 0 && length == 0 &&
+           handling_request.bRequest == USB_REQ_SET_ADDRESS &&
+           (handling_request.bRequestType & (USB_TYPE_MASK | USB_RECIP_MASK)) ==
+               (USB_TYPE_STANDARD | USB_RECIP_DEVICE)) {
+            logf("usb_core: applying deferred SET_ADR %d",
+                 handling_request.wValue);
+            usb_drv_set_address(handling_request.wValue);
+            usb_core_do_set_addr(handling_request.wValue);
+        }
+
         set_ep0_state(EP0_READY);
         break;
     default:
